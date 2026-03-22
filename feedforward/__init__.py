@@ -136,23 +136,69 @@ class FeedForward_Model(torch.nn.Module):
             else:
                 input_intrinsics = None
                 input_extrinsics = None
+            # The installed DepthAnything3 API expects a Python list of per-view images
+            # for its internal parallel preprocessor, not a stacked torch tensor.
+            dav3_images = [
+                np.clip(img.detach().cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8, copy=False)
+                for img in images_ff
+            ]
             dav3_results = self.model.inference(
-                image=images_ff.permute(0,3,1,2).unsqueeze(0),
-                intrinsics=input_intrinsics,
-                extrinsics=input_extrinsics) # 1, N, C, H, W
+                image=dav3_images,
+                intrinsics=input_intrinsics.detach().cpu().numpy() if input_intrinsics is not None else None,
+                extrinsics=input_extrinsics.detach().cpu().numpy() if input_extrinsics is not None else None,
+                process_res=int(images_ff.shape[2]),
+            )
 
             H, W = images_ff.shape[1:3]
+            def _dav3_get(x, key):
+                if isinstance(x, dict):
+                    return x[key]
+                return getattr(x, key)
 
-            output_dict['extrinsics'] = dav3_results['extrinsics'][0].float()
-            output_dict['intrinsics'] = dav3_results['intrinsics'][0].float().clone()
+            def _dav3_get_optional(x, *keys):
+                if isinstance(x, dict):
+                    for key in keys:
+                        if key in x and x[key] is not None:
+                            return x[key]
+                    return None
+                for key in keys:
+                    value = getattr(x, key, None)
+                    if value is not None:
+                        return value
+                return None
+
+            def _to_tensor(x):
+                if isinstance(x, torch.Tensor):
+                    return x.detach().float()
+                return torch.from_numpy(np.asarray(x)).float()
+
+            extrinsics = _to_tensor(_dav3_get(dav3_results, 'extrinsics'))
+            intrinsics = _to_tensor(_dav3_get(dav3_results, 'intrinsics')).clone()
+            depths = _to_tensor(_dav3_get(dav3_results, 'depth'))
+            depth_conf_raw = _dav3_get_optional(dav3_results, 'depth_conf', 'conf')
+            if depth_conf_raw is None:
+                raise AssertionError("DepthAnything3 returned no confidence map; GGPT's DA3 path requires per-pixel confidence.")
+            depth_conf = _to_tensor(depth_conf_raw)
+
+            if extrinsics.ndim != 3 or intrinsics.ndim != 3 or depths.ndim != 3 or depth_conf.ndim != 3:
+                raise AssertionError(
+                    "Unexpected DepthAnything3 output shapes: "
+                    f"extrinsics={tuple(extrinsics.shape)} "
+                    f"intrinsics={tuple(intrinsics.shape)} "
+                    f"depth={tuple(depths.shape)} "
+                    f"conf={tuple(depth_conf.shape)}"
+                )
+
+            output_dict['extrinsics'] = extrinsics.to(device)
+            output_dict['intrinsics'] = intrinsics.to(device)
             #Convert to opencv convention (cx = W-1/2, cy=H/2)
             output_dict['intrinsics'][...,1,2] = output_dict['intrinsics'][...,1,2] - 0.5
             output_dict['intrinsics'][...,0,2] = output_dict['intrinsics'][...,0,2] - 0.5
             output_dict['points'] = unproject_depth_map_to_point_map_torch(
-                depth_map=dav3_results.depth.view(-1,H,W),
+                depth_map=depths.to(device).view(-1,H,W),
                 extrinsics_cam=output_dict['extrinsics'][...,:3,:].view(-1,3,4),
                 intrinsics_cam=output_dict['intrinsics'].view(-1,3,3))
-            output_dict['points_conf'] = dav3_results['depth_conf'].view(-1,H,W)
+            output_dict['points_conf'] = depth_conf.to(device).view(-1,H,W)
         elif self.configs.model in ['pi3', 'pi3x']:
             dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
             if self.configs.model == 'pi3x':

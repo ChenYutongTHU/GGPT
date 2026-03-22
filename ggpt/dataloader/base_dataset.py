@@ -1,6 +1,7 @@
 import torch 
 import torch.nn as nn
 import numpy as np
+import zlib
 import os, random, cv2, math
 from torch.utils.data import  DataLoader
 from tqdm import tqdm
@@ -144,7 +145,8 @@ class BaseDataset(torch.utils.data.Dataset):
     def split_scenes_random(self, scene):
         scene_chunks = []
         tosample_geo_msk = scene['geo_msks'].clone()
-        generator = np.random.default_rng(hash(scene['scene_name'])% (2**32)) # Deteministic sampling for each scene 
+        # Use a process-stable scene seed; Python's built-in hash is salted per process.
+        generator = np.random.default_rng(zlib.crc32(scene['scene_name'].encode('utf-8')) % (2**32))
         min_geo_pts_perchunk, min_ff_pts_perchunk = self.min_geo_pts_perchunk, self.min_ff_pts_perchunk
             
         fail_count = 0
@@ -247,5 +249,4 @@ class BaseDataset(torch.utils.data.Dataset):
             return scene_chunks, scene
         
     
-
 
