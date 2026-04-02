@@ -1,5 +1,11 @@
+import json
 import os
+import shutil
+import zlib
+from colorsys import hsv_to_rgb
+from html import escape
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 # import pycolmap
@@ -11,6 +17,11 @@ from utils.geometry import compute_epipolar_errors, homo
 from tqdm import tqdm
 
 
+def _env_flag(name, default=False):
+    val = os.environ.get(name, "1" if default else "0").strip().lower()
+    return val in {"1", "true", "yes", "y", "on"}
+
+
 def _visible_mean(values, mask):
     mask_f = mask.float()
     denom = mask_f.sum(0).clamp_min(1.0)
@@ -19,6 +30,511 @@ def _visible_mean(values, mask):
 
 def _inv1p_score(values):
     return 1.0 / (1.0 + torch.clamp(values.float(), min=0.0))
+
+
+def _to_rgb_u8(images_hw3):
+    if not isinstance(images_hw3, torch.Tensor):
+        images_hw3 = torch.as_tensor(images_hw3)
+    arr = images_hw3.detach().cpu().float().clamp(0.0, 1.0).numpy()
+    return np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _dense_query_grid_xy(height, width, device):
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=device, dtype=torch.float32),
+        torch.arange(width, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    return torch.stack((xx, yy), dim=-1).reshape(-1, 2)
+
+
+def _in_bounds_xy(xy, width, height):
+    finite = torch.isfinite(xy).all(dim=-1)
+    return (
+        finite
+        & (xy[:, 0] >= 0.0)
+        & (xy[:, 0] <= float(width - 1))
+        & (xy[:, 1] >= 0.0)
+        & (xy[:, 1] <= float(height - 1))
+    )
+
+
+def _xy_to_bgr_u8(xy, width, height):
+    x = float(xy[0]) / max(float(width - 1), 1.0)
+    y = float(xy[1]) / max(float(height - 1), 1.0)
+    h = (x + 0.37 * y) % 1.0
+    r, g, b = hsv_to_rgb(h, 1.0, 1.0)
+    return (
+        int(round(b * 255.0)),
+        int(round(g * 255.0)),
+        int(round(r * 255.0)),
+    )
+
+
+def _draw_matches_side_by_side_local(img_src_u8, img_tgt_u8, xy_src, xy_tgt, width, height, *, radius):
+    import cv2
+
+    out = np.concatenate([img_src_u8, img_tgt_u8], axis=1)
+    src_width = img_src_u8.shape[1]
+    num_points = int(min(xy_src.shape[0], xy_tgt.shape[0]))
+    for idx in range(num_points):
+        p_src = xy_src[idx]
+        p_tgt = xy_tgt[idx]
+        if not np.isfinite(p_src).all() or not np.isfinite(p_tgt).all():
+            continue
+        x0, y0 = int(round(float(p_src[0]))), int(round(float(p_src[1])))
+        x1, y1 = int(round(float(p_tgt[0]))), int(round(float(p_tgt[1])))
+        if not (0 <= x0 < width and 0 <= y0 < height and 0 <= x1 < width and 0 <= y1 < height):
+            continue
+        col = _xy_to_bgr_u8((x0, y0), width, height)
+        cv2.circle(out, (x0, y0), radius, col, -1, lineType=cv2.LINE_AA)
+        cv2.circle(out, (src_width + x1, y1), radius, col, -1, lineType=cv2.LINE_AA)
+    return out
+
+
+def _stack_pair_image_vertically(tile_rgb):
+    h, w = tile_rgb.shape[:2]
+    mid = w // 2
+    top = tile_rgb[:, :mid]
+    bottom = tile_rgb[:, mid:]
+    out_w = max(top.shape[1], bottom.shape[1])
+    if top.shape[1] != out_w:
+        top = np.pad(top, ((0, 0), (0, out_w - top.shape[1]), (0, 0)), mode="constant")
+    if bottom.shape[1] != out_w:
+        bottom = np.pad(bottom, ((0, 0), (0, out_w - bottom.shape[1]), (0, 0)), mode="constant")
+    return np.concatenate([top, bottom], axis=0)
+
+
+def _blank_pair_tile(img_src_u8, img_tgt_u8):
+    h_out = int(img_src_u8.shape[0] + img_tgt_u8.shape[0])
+    w_out = int(max(img_src_u8.shape[1], img_tgt_u8.shape[1]))
+    out = np.zeros((h_out, w_out, 3), dtype=np.uint8)
+    out[: img_src_u8.shape[0], : img_src_u8.shape[1]] = img_src_u8
+    out[img_src_u8.shape[0]: img_src_u8.shape[0] + img_tgt_u8.shape[0], : img_tgt_u8.shape[1]] = img_tgt_u8
+    return out
+
+
+def _draw_pair_stage_tile(img_src_u8, img_tgt_u8, xy_src, xy_tgt, width, height, *, radius=2):
+    if xy_src.shape[0] == 0:
+        return _blank_pair_tile(img_src_u8, img_tgt_u8)
+    side_by_side = _draw_matches_side_by_side_local(
+        img_src_u8,
+        img_tgt_u8,
+        xy_src,
+        xy_tgt,
+        width,
+        height,
+        radius=radius,
+    )
+    return _stack_pair_image_vertically(side_by_side)
+
+
+def _draw_pair_stage_tile_colored(img_src_u8, img_tgt_u8, xy_src, xy_tgt, colors_bgr, *, radius=1):
+    import cv2
+
+    if xy_src.shape[0] == 0:
+        return _blank_pair_tile(img_src_u8, img_tgt_u8)
+    top_h, top_w = img_src_u8.shape[:2]
+    bot_h, bot_w = img_tgt_u8.shape[:2]
+    out_w = int(max(top_w, bot_w))
+    out_h = int(top_h + bot_h)
+    out = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    out[:top_h, :top_w] = img_src_u8
+    out[top_h:top_h + bot_h, :bot_w] = img_tgt_u8
+    n = int(min(xy_src.shape[0], xy_tgt.shape[0], colors_bgr.shape[0]))
+    for i in range(n):
+        p0 = xy_src[i]
+        p1 = xy_tgt[i]
+        if not np.isfinite(p0).all() or not np.isfinite(p1).all():
+            continue
+        x0, y0 = int(round(float(p0[0]))), int(round(float(p0[1])))
+        x1, y1 = int(round(float(p1[0]))), int(round(float(p1[1])))
+        if not (0 <= x0 < top_w and 0 <= y0 < top_h and 0 <= x1 < bot_w and 0 <= y1 < bot_h):
+            continue
+        col = tuple(int(v) for v in colors_bgr[i])
+        cv2.circle(out, (x0, y0), radius, col, -1, lineType=cv2.LINE_AA)
+        cv2.circle(out, (x1, top_h + y1), radius, col, -1, lineType=cv2.LINE_AA)
+    return out
+
+
+def _skew_symmetric(t):
+    tx = torch.zeros((3, 3), dtype=t.dtype, device=t.device)
+    tx[0, 1] = -t[2]
+    tx[0, 2] = t[1]
+    tx[1, 0] = t[2]
+    tx[1, 2] = -t[0]
+    tx[2, 0] = -t[1]
+    tx[2, 1] = t[0]
+    return tx
+
+
+def _fundamental_from_cameras(w2c_src, w2c_tgt, K_src, K_tgt):
+    R_src, t_src = w2c_src[:3, :3], w2c_src[:3, 3]
+    R_tgt, t_tgt = w2c_tgt[:3, :3], w2c_tgt[:3, 3]
+    R_rel = R_tgt @ R_src.T
+    t_rel = t_tgt - R_rel @ t_src
+    E = _skew_symmetric(t_rel) @ R_rel
+    K_src_inv = torch.linalg.inv(K_src)
+    K_tgt_inv_t = torch.linalg.inv(K_tgt).T
+    return K_tgt_inv_t @ E @ K_src_inv
+
+
+def _sample_indices(num_points, max_points, seed):
+    if num_points <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    if num_points <= max_points:
+        return np.arange(num_points, dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(num_points, size=max_points, replace=False).astype(np.int64))
+
+
+def _random_rainbow_bgr_u8(num_points, seed):
+    if num_points <= 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    rng = np.random.default_rng(seed)
+    hues = np.linspace(0.0, 1.0, num_points, endpoint=False, dtype=np.float32)
+    rng.shuffle(hues)
+    colors = np.zeros((num_points, 3), dtype=np.uint8)
+    for i, h in enumerate(hues):
+        r, g, b = hsv_to_rgb(float(h), 0.9, 1.0)
+        colors[i] = np.array([
+            int(round(b * 255.0)),
+            int(round(g * 255.0)),
+            int(round(r * 255.0)),
+        ], dtype=np.uint8)
+    return colors
+
+
+def _draw_epipolar_line(canvas, line_rgb, width, height, color_rgb, thickness=1):
+    import cv2
+
+    a, b, c = [float(v) for v in line_rgb]
+    eps = 1e-8
+    if abs(a) < eps and abs(b) < eps:
+        return
+    if abs(b) > abs(a):
+        y0 = -c / (b + eps)
+        y1 = -(a * float(width - 1) + c) / (b + eps)
+        pt1 = (0, int(round(y0)))
+        pt2 = (int(width - 1), int(round(y1)))
+    else:
+        x0 = -c / (a + eps)
+        x1 = -(b * float(height - 1) + c) / (a + eps)
+        pt1 = (int(round(x0)), 0)
+        pt2 = (int(round(x1)), int(height - 1))
+    ok, clipped_pt1, clipped_pt2 = cv2.clipLine((0, 0, int(width), int(height)), pt1, pt2)
+    if not ok:
+        return
+    cv2.line(canvas, clipped_pt1, clipped_pt2, color_rgb, thickness, lineType=cv2.LINE_AA)
+
+
+def _draw_pair_epiline_tile(
+        img_src_u8,
+        img_tgt_u8,
+        xy_src,
+        xy_tgt,
+        F_src_to_tgt,
+        *,
+        max_draw=24,
+        max_lines=24,
+        seed=0,
+        radius=1,
+        epi_thresh_px=1.0,
+):
+    import cv2
+
+    if xy_src.shape[0] == 0:
+        return _blank_pair_tile(img_src_u8, img_tgt_u8), {
+            "sampled": 0,
+            "available": 0,
+            "epi_inl": 0,
+            "epi_out": 0,
+            "epi_err_mean": 0.0,
+        }
+
+    top_h, top_w = img_src_u8.shape[:2]
+    bot_h, bot_w = img_tgt_u8.shape[:2]
+    out = _blank_pair_tile(img_src_u8, img_tgt_u8)
+    top = out[:top_h, :top_w]
+    bot = out[top_h:top_h + bot_h, :bot_w]
+    sample_ids = _sample_indices(xy_src.shape[0], max_draw, seed)
+    if sample_ids.size == 0:
+        return out, {
+            "sampled": 0,
+            "available": int(xy_src.shape[0]),
+            "epi_inl": 0,
+            "epi_out": 0,
+            "epi_err_mean": 0.0,
+        }
+    pts_src = xy_src[sample_ids]
+    pts_tgt = xy_tgt[sample_ids]
+    lines_tgt = homo(torch.from_numpy(pts_src).float()) @ F_src_to_tgt.detach().cpu().float().T
+    lines_tgt = lines_tgt.numpy()
+    lines_src = homo(torch.from_numpy(pts_tgt).float()) @ F_src_to_tgt.detach().cpu().float()
+    lines_src = lines_src.numpy()
+    tgt_h = homo(torch.from_numpy(pts_tgt).float()).numpy()
+    den = np.linalg.norm(lines_tgt[:, :2], axis=1)
+    epi_err = np.abs(np.sum(lines_tgt * tgt_h, axis=1)) / np.clip(den, 1e-8, None)
+    epi_inlier = epi_err < float(epi_thresh_px)
+    line_draw_ids = _sample_indices(sample_ids.size, max_lines, seed ^ 0xA5A5F00D)
+    draw_line_mask = np.zeros((sample_ids.size,), dtype=bool)
+    draw_line_mask[line_draw_ids] = True
+    colors_bgr = _random_rainbow_bgr_u8(sample_ids.size, seed ^ 0x51A7C0DE)
+    for idx in range(sample_ids.size):
+        p0 = pts_src[idx]
+        p1 = pts_tgt[idx]
+        if not np.isfinite(p0).all() or not np.isfinite(p1).all():
+            continue
+        x0, y0 = int(round(float(p0[0]))), int(round(float(p0[1])))
+        x1, y1 = int(round(float(p1[0]))), int(round(float(p1[1])))
+        if not (0 <= x0 < top_w and 0 <= y0 < top_h and 0 <= x1 < bot_w and 0 <= y1 < bot_h):
+            continue
+        col = colors_bgr[idx]
+        if draw_line_mask[idx]:
+            _draw_epipolar_line(top, lines_src[idx], top_w, top_h, tuple(int(v) for v in col), thickness=1)
+            _draw_epipolar_line(bot, lines_tgt[idx], bot_w, bot_h, tuple(int(v) for v in col), thickness=1)
+        cv2.circle(top, (x0, y0), radius, tuple(int(v) for v in col), -1, lineType=cv2.LINE_AA)
+        cv2.circle(bot, (x1, y1), radius, tuple(int(v) for v in col), -1, lineType=cv2.LINE_AA)
+    return out, {
+        "sampled": int(sample_ids.size),
+        "available": int(xy_src.shape[0]),
+        "line_drawn": int(draw_line_mask.sum()),
+        "epi_inl": int(epi_inlier.sum()),
+        "epi_out": int(sample_ids.size - int(epi_inlier.sum())),
+        "epi_err_mean": float(epi_err.mean()) if epi_err.size else 0.0,
+    }
+
+
+def _write_scene_pair_html(scene_root, scene_name, ordered_rows):
+    lines = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'>",
+        f"<title>{escape(scene_name)}</title>",
+        "<style>",
+        "body{background:#0f1116;color:#e6e6e6;font:14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;margin:24px;}",
+        "a{color:#9ecbff;text-decoration:none}",
+        "a:hover{text-decoration:underline}",
+        "table{border-collapse:collapse;width:100%;}",
+        "th,td{border:1px solid #2b2f3a;padding:10px;vertical-align:top;}",
+        "th{position:sticky;top:0;background:#171b22;z-index:1;}",
+        "tr:nth-child(even){background:#12161d;}",
+        ".pair{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;}",
+        "img{display:block;width:100%;max-width:760px;height:auto;background:#000;}",
+        ".cell{min-width:320px}",
+        ".meta{color:#9da7b3;font-size:12px;margin:0 0 8px 0}",
+        "</style></head><body>",
+        f"<h1>{escape(scene_name)}</h1>",
+        "<table>",
+        "<p class='meta'>5_EPI colors the raw pair matches by BA-camera epipolar agreement: green=inlier, red=outlier.</p>",
+        "<p class='meta'>6_EPI_LINES samples up to 24 3_BA_TRACKS correspondences, assigns each one a deterministic random rainbow color, and draws anti-aliased 1px BA-camera epipolar lines in both images for those same 24 points.</p>",
+        "<thead><tr><th>Pair</th><th>1_RAW</th><th>2_BA_GATE</th><th>3_BA_TRACKS</th><th>4_DLT</th><th>5_EPI</th><th>6_EPI_LINES</th></tr></thead>",
+        "<tbody>",
+    ]
+    for row in ordered_rows:
+        lines.append("<tr>")
+        lines.append(f"<td class='pair'>{escape(row['pair'])}</td>")
+        for stage_name in ("1_RAW", "2_BA_GATE", "3_BA_TRACKS", "4_DLT", "5_EPI", "6_EPI_LINES"):
+            rel = row["images"].get(stage_name)
+            count = row["counts"].get(stage_name)
+            meta = row.get("meta", {}).get(stage_name)
+            if rel is None:
+                lines.append("<td class='cell'></td>")
+                continue
+            rel_posix = rel.replace(os.sep, "/")
+            if meta is None:
+                meta = f"{stage_name}"
+                if count is not None:
+                    meta += f" | n={int(count)}"
+            lines.append(
+                "<td class='cell'>"
+                f"<a href='{escape(rel_posix)}'><img loading='lazy' src='{escape(rel_posix)}' alt='{escape(stage_name)} {escape(row['pair'])}'></a>"
+                f"<div class='meta'>{escape(meta)}</div>"
+                "</td>"
+            )
+        lines.append("</tr>")
+    lines.extend(["</tbody></table>", "</body></html>"])
+    with open(os.path.join(scene_root, "index.html"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _maybe_write_match_debug_grids(
+        *,
+        images_ff,
+        pred_matches_lr,
+        mask_ba_dense,
+        mask_dlt_dense_post_epi,
+        mask_epi_dense,
+        tracks_ba,
+        tracks_mask_ba,
+        ba_intrinsics,
+        ba_extrinsics,
+        epi_thresh_px,
+        output_dir,
+):
+    if not _env_flag("GGPTSFM_MATCH_GRIDS", default=False):
+        return
+    grid_root = output_dir or os.environ.get("GGPTSFM_MATCH_GRID_DIR", "").strip()
+    if not grid_root:
+        return
+
+    images_u8 = _to_rgb_u8(images_ff)
+    num_views, height, width = images_u8.shape[:3]
+    query_xy = _dense_query_grid_xy(height, width, pred_matches_lr.device)
+    stage_records = {"1_RAW": [], "2_BA_GATE": [], "3_BA_TRACKS": [], "4_DLT": [], "5_EPI": [], "6_EPI_LINES": []}
+
+    for src in range(num_views):
+        for tgt in range(src + 1, num_views):
+            pair_name = f"{src:02d}-{tgt:02d}"
+            xy_src_all = query_xy
+            xy_tgt_all = pred_matches_lr[tgt, src].detach().float()
+            raw_mask = _in_bounds_xy(xy_src_all, width, height) & _in_bounds_xy(xy_tgt_all, width, height)
+            raw_idx = torch.nonzero(raw_mask, as_tuple=False).reshape(-1)
+            raw_tile = _draw_pair_stage_tile(
+                images_u8[src],
+                images_u8[tgt],
+                xy_src_all[raw_idx].detach().cpu().numpy(),
+                xy_tgt_all[raw_idx].detach().cpu().numpy(),
+                width,
+                height,
+                radius=1,
+            )
+            stage_records["1_RAW"].append({"pair": pair_name, "count": int(raw_mask.sum().item()), "tile": raw_tile})
+
+            epi_dense_mask = raw_mask & mask_epi_dense[tgt, src].detach().bool()
+            epi_idx = raw_idx
+            epi_inlier_raw = epi_dense_mask[epi_idx].detach().cpu().numpy().astype(bool)
+            epi_colors = np.zeros((epi_idx.shape[0], 3), dtype=np.uint8)
+            epi_colors[epi_inlier_raw] = np.array([0, 255, 0], dtype=np.uint8)
+            epi_colors[~epi_inlier_raw] = np.array([255, 0, 0], dtype=np.uint8)
+            epi_tile = _draw_pair_stage_tile_colored(
+                images_u8[src],
+                images_u8[tgt],
+                xy_src_all[epi_idx].detach().cpu().numpy(),
+                xy_tgt_all[epi_idx].detach().cpu().numpy(),
+                epi_colors,
+                radius=1,
+            )
+            epi_inlier_count = int(epi_dense_mask.sum().item())
+            epi_total_count = int(raw_mask.sum().item())
+            stage_records["5_EPI"].append({
+                "pair": pair_name,
+                "count": epi_total_count,
+                "tile": epi_tile,
+                "meta": f"5_EPI | raw={epi_total_count} | epi_inl={epi_inlier_count} | epi_out={epi_total_count - epi_inlier_count}",
+            })
+
+            ba_dense_mask = raw_mask & mask_ba_dense[tgt, src].detach().bool()
+            ba_dense_idx = torch.nonzero(ba_dense_mask, as_tuple=False).reshape(-1)
+            ba_tile = _draw_pair_stage_tile(
+                images_u8[src],
+                images_u8[tgt],
+                xy_src_all[ba_dense_idx].detach().cpu().numpy(),
+                xy_tgt_all[ba_dense_idx].detach().cpu().numpy(),
+                width,
+                height,
+                radius=1,
+            )
+            stage_records["2_BA_GATE"].append({"pair": pair_name, "count": int(ba_dense_mask.sum().item()), "tile": ba_tile})
+
+            ba_track_mask = tracks_mask_ba[src].detach().bool() & tracks_mask_ba[tgt].detach().bool()
+            if ba_track_mask.any():
+                ba_track_xy_src = tracks_ba[src].detach().float()
+                ba_track_xy_tgt = tracks_ba[tgt].detach().float()
+                ba_track_mask = (
+                    ba_track_mask
+                    & _in_bounds_xy(ba_track_xy_src, width, height)
+                    & _in_bounds_xy(ba_track_xy_tgt, width, height)
+                )
+                ba_track_idx = torch.nonzero(ba_track_mask, as_tuple=False).reshape(-1)
+                ba_track_tile = _draw_pair_stage_tile(
+                    images_u8[src],
+                    images_u8[tgt],
+                    ba_track_xy_src[ba_track_idx].detach().cpu().numpy(),
+                    ba_track_xy_tgt[ba_track_idx].detach().cpu().numpy(),
+                    width,
+                    height,
+                    radius=1,
+                )
+                ba_track_count = int(ba_track_mask.sum().item())
+            else:
+                ba_track_tile = _blank_pair_tile(images_u8[src], images_u8[tgt])
+                ba_track_count = 0
+            stage_records["3_BA_TRACKS"].append({"pair": pair_name, "count": ba_track_count, "tile": ba_track_tile})
+            if ba_track_count > 0:
+                F_src_to_tgt = _fundamental_from_cameras(
+                    ba_extrinsics[src].detach().float(),
+                    ba_extrinsics[tgt].detach().float(),
+                    ba_intrinsics[src].detach().float(),
+                    ba_intrinsics[tgt].detach().float(),
+                )
+                line_seed = zlib.crc32(f"{os.path.basename(grid_root)}|{pair_name}|6_EPI_LINES".encode("utf-8")) & 0xFFFFFFFF
+                epi_line_tile, epi_line_stats = _draw_pair_epiline_tile(
+                    images_u8[src],
+                    images_u8[tgt],
+                    ba_track_xy_src[ba_track_idx].detach().cpu().numpy(),
+                    ba_track_xy_tgt[ba_track_idx].detach().cpu().numpy(),
+                    F_src_to_tgt,
+                    max_draw=24,
+                    max_lines=24,
+                    seed=line_seed,
+                    radius=1,
+                    epi_thresh_px=epi_thresh_px,
+                )
+                stage_records["6_EPI_LINES"].append({
+                    "pair": pair_name,
+                    "count": ba_track_count,
+                    "tile": epi_line_tile,
+                    "meta": (
+                        f"6_EPI_LINES | sampled={epi_line_stats['sampled']}/{epi_line_stats['available']} "
+                        f"| lines={epi_line_stats['line_drawn']} "
+                        f"| epi_inl={epi_line_stats['epi_inl']} | epi_out={epi_line_stats['epi_out']} "
+                        f"| mean_err={epi_line_stats['epi_err_mean']:.2f}px"
+                    ),
+                })
+            else:
+                stage_records["6_EPI_LINES"].append({
+                    "pair": pair_name,
+                    "count": 0,
+                    "tile": _blank_pair_tile(images_u8[src], images_u8[tgt]),
+                    "meta": "6_EPI_LINES | sampled=0/0 | lines=0 | epi_inl=0 | epi_out=0 | mean_err=0.00px",
+                })
+
+            dlt_dense_post_mask = raw_mask & mask_dlt_dense_post_epi[tgt, src].detach().bool()
+            dlt_dense_post_idx = torch.nonzero(dlt_dense_post_mask, as_tuple=False).reshape(-1)
+            dlt_tile = _draw_pair_stage_tile(
+                images_u8[src],
+                images_u8[tgt],
+                xy_src_all[dlt_dense_post_idx].detach().cpu().numpy(),
+                xy_tgt_all[dlt_dense_post_idx].detach().cpu().numpy(),
+                width,
+                height,
+                radius=1,
+            )
+            stage_records["4_DLT"].append({"pair": pair_name, "count": int(dlt_dense_post_mask.sum().item()), "tile": dlt_tile})
+
+    if os.path.isdir(grid_root):
+        shutil.rmtree(grid_root)
+    os.makedirs(grid_root, exist_ok=True)
+    manifest = {"num_views": int(num_views), "pairs": []}
+    row_map = {}
+    for stage_name in ("1_RAW", "2_BA_GATE", "3_BA_TRACKS", "4_DLT", "5_EPI", "6_EPI_LINES"):
+        stage_dir = os.path.join(grid_root, stage_name)
+        os.makedirs(stage_dir, exist_ok=True)
+        for record in stage_records[stage_name]:
+            pair_name = record["pair"]
+            filename = f"{pair_name}.png"
+            out_path = os.path.join(stage_dir, filename)
+            imageio.imwrite(out_path, record["tile"])
+            row = row_map.setdefault(pair_name, {"pair": pair_name, "images": {}, "counts": {}, "meta": {}})
+            row["images"][stage_name] = os.path.join(stage_name, filename)
+            row["counts"][stage_name] = int(record["count"])
+            if "meta" in record:
+                row["meta"][stage_name] = str(record["meta"])
+    ordered_rows = [row_map[key] for key in sorted(row_map.keys())]
+    manifest["pairs"] = ordered_rows
+    with open(os.path.join(grid_root, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    _write_scene_pair_html(grid_root, os.path.basename(grid_root.rstrip(os.sep)), ordered_rows)
 
 
 def run_sfm(
@@ -65,6 +581,9 @@ def run_sfm(
 
     M_ba = (pred_scores > cfg.ba_config.score_thresh) & (pred_cycle_error < cfg.ba_config.cycle_err_thresh)
     M_dlt = (pred_scores > cfg.dlt_config.score_thresh) & (pred_cycle_error < cfg.dlt_config.cycle_err_thresh)
+    M_ba_dense = M_ba.clone()
+    M_dlt_dense_pre_epi = M_dlt.clone()
+    M_epi_dense = torch.zeros_like(M_ba_dense, dtype=torch.bool)
 
     """
     2. Sparse ba (TODO: support known camera poses)
@@ -249,8 +768,10 @@ def run_sfm(
         epipolar_errors_msk = (dis_a < cfg.dlt_config.max_epipolar_error) & (dis_b < cfg.dlt_config.max_epipolar_error) 
         epipolar_errors_msk[ni,:,:] = True  #self-view
         epipolar_errors_msk = epipolar_errors_msk.view(N, ff_h*ff_w) #(Ntgt, H*W)
+        M_epi_dense[:, ni] = epipolar_errors_msk
         M_dlt[:,ni] = M_dlt[:,ni] & epipolar_errors_msk  #(Ntgt, H*W)
         M_ba_debug[:,ni] = M_ba_debug[:,ni] & epipolar_errors_msk  #(Ntgt, H*W)
+    M_dlt_dense_post_epi = M_dlt.clone()
     M_dlt = M_dlt.reshape(N,-1) #Ntgt, Nsrc*H*W
     remaining_tracks = (M_dlt.sum(axis=0)>=2)  #(Nsrc*H*W,)
     print(f"Number of tracks used for DLT triangulation: {remaining_tracks.sum().item()}")
@@ -259,6 +780,20 @@ def run_sfm(
     tracks_mask_dlt = M_dlt[:,remaining_tracks]  #Nview, Ntracks_dlt
     tracks_score_dlt = pred_scores_flat[:,remaining_tracks].to(device)
     tracks_cycle_dlt = pred_cycle_error_flat[:,remaining_tracks].to(device)
+
+    _maybe_write_match_debug_grids(
+        images_ff=images_ff,
+        pred_matches_lr=match_results['pred_matches_lr'],
+        mask_ba_dense=M_ba_dense,
+        mask_dlt_dense_post_epi=M_dlt_dense_post_epi,
+        mask_epi_dense=M_epi_dense,
+        tracks_ba=tracks_ba,
+        tracks_mask_ba=tracks_mask_ba,
+        ba_intrinsics=output_dict['intrinsics'],
+        ba_extrinsics=output_dict['extrinsics'],
+        epi_thresh_px=cfg.dlt_config.max_epipolar_error,
+        output_dir=output_dir,
+    )
 
     weights = tracks_mask_dlt.float()
     max_pts_num = cfg.dlt_config.get('batch_size', 500000)
