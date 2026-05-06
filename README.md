@@ -170,6 +170,13 @@ While our work demonstrates that geometry optimization provides meaningful const
 We invite you to share failure cases via GitHub Issues to help guide future research!
 
 
+## License
+
+We release the GGPT code and point transformer model weights under the MIT License.
+
+GGPT builds on several third-party components, including RoMa (RoMaV2), VGGT, Pi3X, and DepthAnything3. These components are subject to their own licences, which may include additional restrictions (e.g. research-only use for certain model weights).
+
+Users are responsible for complying with the respective licences of these dependencies when using GGPT. Please refer to the original repositories for detailed licensing terms.
 
 
 
