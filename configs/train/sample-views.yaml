@@ -1,0 +1,42 @@
+output_dir: outputs/train/sample_views/scannetpp-train
+save_vis: True
+common_config: #Most of the following are useless
+  img_size: 518
+  patch_size: 14
+  augs:
+    scales: [0.8, 1.2]
+    cojitter: false
+    cojitter_ratio: null
+    color_jitter: null
+    gray_scale: false
+    gau_blur: false
+  rescale: true
+  rescale_aug: true
+  landscape_check: true
+  fix_img_num: false
+  fix_aspect_ratio: false
+  load_track: false
+  track_num: null
+  training: true
+  inside_random: false   # must stay false: sample_views.py enumerates scenes deterministically
+  num_workers: 8
+
+sample_configs:
+  max_seq_num: null
+  max_image: 160
+  num_sequences_per_scene: 8
+  N_r_alpha:
+    - N_range: [4,16]
+      r_range: [0.3, 1.0]
+      alpha_range: [5, 180]
+
+valdataset_configs:
+- _target_: data.raw_dataloaders.scannetpp.ScanNetPPDataset
+  name: scannet_train
+  root: ${oc.env:SCANNETPP_ROOT,scannetpp/data}   # set env var SCANNETPP_ROOT, or override on the CLI
+  split: train
+  step: 5
+
+hydra:
+  run:
+    dir: ${output_dir}   # keep hydra's own .hydra/ logs alongside our own outputs, not in a separate outputs/<date>/<time>/

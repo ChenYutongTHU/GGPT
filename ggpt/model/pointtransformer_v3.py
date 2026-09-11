@@ -6,6 +6,7 @@ from pointcept.models.utils.structure import Point
 from addict import Dict
 import torch_scatter
 import torch
+import torch.nn.functional as F
 
 
 from functools import partial
@@ -28,6 +29,32 @@ from pointcept.models.utils.misc import offset2bincount
 from pointcept.models.utils.structure import Point
 from pointcept.models.modules import PointModule, PointSequential
 from pointcept.models.point_transformer_v3 import SerializedPooling, Embedding, SerializedUnpooling, Block
+
+
+class SafeBatchNorm1d(nn.BatchNorm1d):
+    """
+    BatchNorm1d that avoids training-time crashes when effective batch size is 1.
+    Falls back to running-stat normalization in that case.
+    """
+
+    def forward(self, input):
+        # Effective sample count for BN1d: N (2D) or N*L (3D).
+        eff_n = input.shape[0]
+        if input.dim() == 3:
+            eff_n = eff_n * input.shape[2]
+        if self.training and eff_n <= 1:
+            return F.batch_norm(
+                input,
+                self.running_mean,
+                self.running_var,
+                self.weight,
+                self.bias,
+                False,
+                self.momentum,
+                self.eps,
+            )
+        return super().forward(input)
+
 
 class PointSequential_intermediate_output(PointSequential):
 
@@ -222,7 +249,7 @@ class PointTransformerV3(PointModule):
             bn_layer = partial(
                 PDNorm,
                 norm_layer=partial(
-                    nn.BatchNorm1d, eps=1e-3, momentum=0.01, affine=pdnorm_affine
+                    SafeBatchNorm1d, eps=1e-3, momentum=0.01, affine=pdnorm_affine
                 ),
                 conditions=pdnorm_conditions,
                 decouple=pdnorm_decouple,
@@ -232,7 +259,7 @@ class PointTransformerV3(PointModule):
             if turn_off_bn:
                 bn_layer = nn.Identity
             else:
-                bn_layer = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
+                bn_layer = partial(SafeBatchNorm1d, eps=1e-3, momentum=0.01)
         if pdnorm_ln:
             ln_layer = partial(
                 PDNorm,

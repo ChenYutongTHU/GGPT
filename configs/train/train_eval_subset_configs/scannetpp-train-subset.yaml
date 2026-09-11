@@ -1,0 +1,17 @@
+# data_dict should match traindataset_configs when you change training paths.
+_target_: ggpt.dataloader.train_dataset.TrainSubsetEvalDataset
+max_scenes: 24
+subset_shuffle_seed: null
+seed: 42
+downsample_stride: 1
+data_dict:
+  scannet_train: outputs/train/sfm/train/save/scannetpp_train/*
+pca_transform: False
+chunk_sample: octree
+max_ff_pts_perchunk: ${octree_thresholds.max_ff_pts_perchunk}
+overlap_ratio: ${octree_thresholds.overlap_ratio}
+min_radius_perchunk: ${octree_thresholds.min_radius_perchunk}
+octree_root_trim_quantile: ${octree_thresholds.octree_root_trim_quantile}
+octree_grid_resolution: ${octree_thresholds.octree_grid_resolution}
+octree_occ_downsample_factors: ${octree_thresholds.octree_occ_downsample_factors}
+voxel_density: ${octree_thresholds.voxel_density}

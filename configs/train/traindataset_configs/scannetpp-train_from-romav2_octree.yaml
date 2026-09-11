@@ -1,0 +1,24 @@
+# Octree training: OctreeExhaustiveIterableTrain — scenes round-robin across rank×dataloader
+# workers; each worker loads/splits only its scenes (no upfront full-dataset scan).
+# Full batches only (drop_last per scene). len(TrainDataset) is undefined for octree.
+_target_: ggpt.dataloader.train_dataset.TrainDataset
+data_dict:
+  scannet_train: outputs/train/sfm/train/save/scannetpp_train/*
+max_ff_pts_perchunk: ${octree_thresholds.max_ff_pts_perchunk}
+# Occupancy-aware split using the same quantization grid as PTv3 forward.
+octree_grid_resolution: ${octree_thresholds.octree_grid_resolution}
+# PTv3 has 4 stages of x1/2 downsampling; constrain occupancy at each stage.
+# Base density: 120000 / (384^3) ~= 0.212%
+octree_occ_downsample_factors: ${octree_thresholds.octree_occ_downsample_factors}
+voxel_density: ${octree_thresholds.voxel_density}
+min_geo_pts_perchunk: 1000
+min_ff_pts_perchunk: 10000
+chunk_size: 0.2
+chunk_sample: octree
+octree_exhaustive: true
+overlap_ratio: ${octree_thresholds.overlap_ratio}
+min_radius_perchunk: ${octree_thresholds.min_radius_perchunk}
+octree_root_trim_quantile: ${octree_thresholds.octree_root_trim_quantile}
+seed: 42
+pca_transform: True
+downsample_stride: 1

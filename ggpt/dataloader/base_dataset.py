@@ -14,6 +14,14 @@ class BaseDataset(torch.utils.data.Dataset):
             chunk_size=0.2, max_ff_pts_perchunk=400000, clip_method='shrink',
             min_geo_pts_perchunk=100, min_ff_pts_perchunk=10000, 
             max_num_chunks_after_converge = 100, pca_transform=False, overlap_ratio=0.02,
+            min_radius_perchunk=0.2,
+            octree_grid_resolution=384,
+            voxel_density=None,
+            max_occupied_voxels_perchunk=None,
+            octree_occ_downsample_factors=(1, 2, 4, 8, 16),
+            octree_root_trim_quantile=0.01,
+            train_octree_chunks_per_batch=1,
+            octree_exhaustive=False,
         ):
         """
         A Base Dataset consists of multiple scenes.
@@ -26,14 +34,75 @@ class BaseDataset(torch.utils.data.Dataset):
         self.max_num_chunks_after_converge = max_num_chunks_after_converge
         self.pca_transform = pca_transform
         self.overlap_ratio = overlap_ratio
-    
+        self.min_radius_perchunk = min_radius_perchunk
+        self.octree_grid_resolution = int(octree_grid_resolution)
+        self.voxel_density = (
+            None if voxel_density is None else float(voxel_density)
+        )
+        if self.voxel_density is not None:
+            if not (0.0 < self.voxel_density <= 1.0):
+                raise ValueError(
+                    f"voxel_density must be in (0, 1], got {self.voxel_density}"
+                )
+        self.octree_occ_downsample_factors = tuple(
+            int(s) for s in octree_occ_downsample_factors
+        )
+        self.octree_root_trim_quantile = float(octree_root_trim_quantile)
+        if not (0.0 <= self.octree_root_trim_quantile <= 0.49):
+            raise ValueError(
+                f"octree_root_trim_quantile must be in [0, 0.49], got {self.octree_root_trim_quantile}"
+            )
+        if max_occupied_voxels_perchunk is None:
+            if self.voxel_density is None:
+                self.max_occupied_voxels_perchunk = None
+            else:
+                self.max_occupied_voxels_perchunk = {}
+                for s in self.octree_occ_downsample_factors:
+                    side = max(1.0, self.octree_grid_resolution / float(s))
+                    cap = int(math.ceil(self.voxel_density * (side ** 3)))
+                    self.max_occupied_voxels_perchunk[int(s)] = max(1, cap)
+        elif isinstance(max_occupied_voxels_perchunk, dict):
+            self.max_occupied_voxels_perchunk = {
+                int(k): int(v) for k, v in max_occupied_voxels_perchunk.items()
+            }
+        else:
+            self.max_occupied_voxels_perchunk = int(max_occupied_voxels_perchunk)
+        self.train_octree_chunks_per_batch = int(train_octree_chunks_per_batch)
+        self.octree_exhaustive = bool(octree_exhaustive)
+
+    def _map_train_load_idx(self, idx):
+        """Map dataloader index to load_scene idx (subclasses may override)."""
+        return idx
+
+    def _next_idx_after_sparse_alignment(self, idx):
+        """Advance dataset index when gt∩geo overlap is too small for Umeyama."""
+        return idx + 1
+
     def load_scene_(self, idx):
-        scene = self.load_scene(idx)
         """
         !! IMPORTANT: don't forget to do the alignment!
         Align geo_pts to ff_pts 
         Align gt_pts to geo_pts (if exists)
         """
+        if self.mode in ['train', 'val']:
+            max_attempts = len(self.scene_list) if getattr(self, 'scene_list', None) else len(self)
+            max_attempts = max(max_attempts, 1)
+            idx0 = idx
+            for _ in range(max_attempts):
+                scene = self.load_scene(idx)
+                num_pts = (scene['gt_msks'] & scene['geo_msks']).sum().item()
+                if num_pts >= 10:
+                    break
+                cycle = getattr(self, "sparse_idx_cycle_length", None)
+                mod = cycle if cycle is not None else len(self)
+                idx = self._next_idx_after_sparse_alignment(idx) % mod
+            else:
+                raise RuntimeError(
+                    f"No scene with >=10 gt∩geo points after trying {max_attempts} scenes "
+                    f"(start idx={idx0}). Check data or masks."
+                )
+        else:
+            scene = self.load_scene(idx)
         #scene['geo_pts'] = umeyama_alignment(B=scene['ff_pts'],A=scene['geo_pts'], mask=scene['geo_msks'])[0]
         #scene['geo_pts'][~scene['geo_msks']] = 0
         scene['ff_pts_original'] = scene['ff_pts'].clone()
@@ -43,7 +112,7 @@ class BaseDataset(torch.utils.data.Dataset):
             scene['gt_pts_metric'] = scene['gt_pts'].clone()
             scene['gt_pts'] = umeyama_alignment(B=scene['geo_pts'], A=scene['gt_pts'], mask=scene['gt_msks']& scene['geo_msks'])[0]
             scene['gt_pts'][~scene['gt_msks']] = 0
-        
+
             if 'tandt' in scene['dataset_name']: #HARD-CODED. Here Otherwise, scene scale for TnT outdoor scenes are too large.
                 roi_min, roi_max = self.get_bbox(scene)
                 scene['geo_msks'] &= ( (scene['geo_pts']>=roi_min) & (scene['geo_pts']<=roi_max) ).all(dim=-1)
@@ -157,14 +226,52 @@ class BaseDataset(torch.utils.data.Dataset):
         scene_chunks = []
         #TODO Pre-crop the scene 
         #TODO speed up octree. Downsampling points
-        leaves = points_utils.chunk_by_octree(scene['ff_pts'].reshape(-1,3), MAX=self.max_ff_pts_perchunk)
+        octree_points = (
+            scene['ff_pts'][scene['ff_msks']]
+            if 'ff_msks' in scene
+            else scene['ff_pts'].reshape(-1,3)
+        )
+        leaves = points_utils.chunk_by_octree(
+            octree_points,
+            MAX=self.max_ff_pts_perchunk,
+            min_radius_perchunk=self.min_radius_perchunk,
+            max_occupied_voxels_perchunk=self.max_occupied_voxels_perchunk,
+            grid_resolution=self.octree_grid_resolution,
+            overlap_ratio=self.overlap_ratio,
+            occ_downsample_factors=self.octree_occ_downsample_factors,
+            root_trim_quantile=self.octree_root_trim_quantile,
+        )
+        leaves = self._merge_small_octree_leaves(
+            leaves=leaves,
+            points=octree_points,
+            min_points=int(self.min_ff_pts_perchunk),
+        )
+        scene_leaf_count = int(len(leaves))
+        scene_ff_points_sum = 0
         for leaf in leaves:
             half_size = leaf.half_size*(1+self.overlap_ratio)
             chunk_mins = leaf.center - half_size
             chunk_maxs = leaf.center + half_size
-            chunk_pts, msk_chunk = self.get_crop_mask(scene['ff_pts'], chunk_mins, chunk_maxs, None)
+            _, msk_chunk = self.get_crop_mask(scene['ff_pts'], chunk_mins, chunk_maxs, None)
+            if 'ff_msks' in scene:
+                msk_chunk = msk_chunk & scene['ff_msks']
             #TODO add geo_pts in the chunk, whose ff_pts fall outside the chunk
             num_ff_pts = msk_chunk.sum().item()
+            if num_ff_pts > self.max_ff_pts_perchunk:
+                # Safety cap for octree path: overlap/cropping can still produce
+                # oversized chunks for dense scenes. Randomly subsample to keep
+                # behavior consistent with existing random clipping policy.
+                msk_flat = msk_chunk.reshape(-1)
+                keep_k = int(self.max_ff_pts_perchunk)
+                selected_flat = torch.where(msk_flat)[0]
+                perm = torch.randperm(
+                    selected_flat.numel(), device=selected_flat.device
+                )[:keep_k]
+                selected_flat = selected_flat[perm]
+                capped_flat = torch.zeros_like(msk_flat, dtype=torch.bool)
+                capped_flat[selected_flat] = True
+                msk_chunk = capped_flat.view_as(msk_chunk)
+                num_ff_pts = msk_chunk.sum().item()
             num_geo_pts = scene['geo_msks'][msk_chunk].sum().item()
             if num_ff_pts ==0:
                 continue 
@@ -197,12 +304,62 @@ class BaseDataset(torch.utils.data.Dataset):
                     'ff_pts': scene['ff_pts'][msk_chunk], 'ff_pts_conf': scene['ff_conf'][msk_chunk],
                     'geo_pts': scene['geo_pts'][msk_chunk], 'geo_msks': scene['geo_msks'][msk_chunk],
                     'rgbs': scene['images'][msk_chunk],
+                    # Scene-level octree stats (same for every chunk in this scene).
+                    'scene_chunk_count': scene_leaf_count,
                 }
             if self.mode in ['train', 'val']:
                 chunk['gt_pts'] = scene['gt_pts'][msk_chunk]
                 chunk['gt_msks'] = scene['gt_msks'][msk_chunk]
             scene_chunks.append(chunk)
+            scene_ff_points_sum += int(num_ff_pts)
+        scene_avg_ff_pts = (
+            float(scene_ff_points_sum) / float(max(len(scene_chunks), 1))
+        )
+        for c in scene_chunks:
+            c['scene_avg_ff_points_per_chunk'] = scene_avg_ff_pts
         return scene_chunks
+
+    def _leaf_from_indices(self, points, indices):
+        pts = points[indices]
+        min_xyz = torch.min(pts, dim=0)[0]
+        max_xyz = torch.max(pts, dim=0)[0]
+        center = (min_xyz + max_xyz) / 2.0
+        half_size = torch.max(max_xyz - min_xyz) / 2.0
+        return points_utils.OctreeNode(center=center, half_size=half_size, indices=indices, children=None)
+
+    def _merge_small_octree_leaves(self, leaves, points, min_points):
+        """
+        Enforce a hard floor on leaf size by merging undersized leaves with nearest neighbors.
+        """
+        min_points = int(min_points)
+        valid = [
+            leaf for leaf in leaves
+            if getattr(leaf, "indices", None) is not None and int(leaf.indices.numel()) > 0
+        ]
+        if min_points <= 1 or len(valid) <= 1:
+            return valid
+
+        merged = list(valid)
+        while len(merged) > 1:
+            counts = [int(leaf.indices.numel()) for leaf in merged]
+            small_ids = [i for i, c in enumerate(counts) if c < min_points]
+            if len(small_ids) == 0:
+                break
+            i = small_ids[0]
+            centers = torch.stack([leaf.center for leaf in merged], dim=0)
+            d2 = ((centers - centers[i]) ** 2).sum(dim=1)
+            d2[i] = float("inf")
+            j = int(torch.argmin(d2).item())
+
+            merged_indices = torch.cat([merged[i].indices, merged[j].indices], dim=0)
+            merged_leaf = self._leaf_from_indices(points, merged_indices)
+
+            # Remove both old leaves, append merged one.
+            i0, i1 = sorted([i, j], reverse=True)
+            del merged[i0]
+            del merged[i1]
+            merged.append(merged_leaf)
+        return merged
 
     def pca_transform_scene(self, scene):
         _, eigvecs, mean = points_utils.pca_transform(scene['ff_pts'])
@@ -213,11 +370,21 @@ class BaseDataset(torch.utils.data.Dataset):
         return scene
 
     def __getitem__(self, idx):
-        scene = self.load_scene_(idx)
+        load_idx = self._map_train_load_idx(idx) if self.mode == "train" else idx
+        scene = self.load_scene_(load_idx)
         if self.pca_transform:
             scene = self.pca_transform_scene(scene)
         if self.mode == 'train':
-            raise NotImplementedError
+            if self.chunk_sample == 'random':
+                a_chunk = self.sample_a_chunk(scene, scene['geo_msks'], self.min_geo_pts_perchunk, self.min_ff_pts_perchunk, self.generator)
+                a_chunk = self.normalize_a_chunk(a_chunk)
+                return a_chunk, scene
+            if self.chunk_sample == 'octree':
+                raise RuntimeError(
+                    "Training with chunk_sample='octree' is only supported via octree_exhaustive=True "
+                    "and OctreeExhaustiveIterableTrain in build_train_dataloader (not __getitem__)."
+                )
+            raise NotImplementedError(f"train chunk_sample={self.chunk_sample!r}")
         else:
             if self.chunk_sample == 'random':
                 scene_chunks = self.split_scenes_random(scene)

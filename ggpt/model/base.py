@@ -81,7 +81,12 @@ class BasePredictor(torch.nn.Module):
 
     def sinusoidal_embedding(self, pos, omega_0=100):
         #pos: N,3 in range [-1,1]
-        N,_ = pos.shape
+        N, _ = pos.shape
+        if N == 0:
+            if self.sinusoidal_dim == 0:
+                return pos
+            w = 3 + self.sinusoidal_dim * 3
+            return pos.new_zeros((0, w))
         if self.sinusoidal_dim == 0:
             return pos  
         assert pos.shape[1] == 3
@@ -107,34 +112,72 @@ class BasePredictor(torch.nn.Module):
         coord = []
         grid_coords = []
         for data in batchdata_list:
-            dlt_pts_xyz_all = data['geo_pts'] #N_all,3
-            if dlt_pts_xyz_all.shape[0] == 0:
-                import ipdb; ipdb.set_trace()
-            dlt_pts_xyz_emb_all = self.sinusoidal_embedding(dlt_pts_xyz_all) #N_all,3+sinusoidal_dim*3
-            dlt_pts_xyz_emb_all[~data['geo_msks']] = 0 #zero pad for invalid dlt points
-            dlt_pts_xyz = dlt_pts_xyz_all[data['geo_msks']] #N_valid,3
+            ff_pts_xyz = data['ff_pts']  # K,3
+            device, dtype = ff_pts_xyz.device, ff_pts_xyz.dtype
+            dlt_pts_xyz_all = data['geo_pts']  # N_all,3
+            geo_msks = data['geo_msks']
+            geo_empty = (
+                not isinstance(dlt_pts_xyz_all, torch.Tensor)
+                or dlt_pts_xyz_all.numel() == 0
+                or dlt_pts_xyz_all.shape[0] == 0
+            )
+            dlt_emb_w = (
+                3 if self.sinusoidal_dim == 0 else 3 + self.sinusoidal_dim * 3
+            )
+
+            if geo_empty:
+                dlt_pts_xyz_emb_all = torch.empty(
+                    0, dlt_emb_w, device=device, dtype=dtype
+                )
+                dlt_pts_xyz = torch.empty(0, 3, device=device, dtype=dtype)
+            else:
+                dlt_pts_xyz_emb_all = self.sinusoidal_embedding(dlt_pts_xyz_all)
+                dlt_pts_xyz_emb_all[~geo_msks] = 0
+                dlt_pts_xyz = dlt_pts_xyz_all[geo_msks]
             N_dlt_pts = dlt_pts_xyz.shape[0]
             if self.use_ff_only:
                 N_dlt_pts = 0
             if N_dlt_pts > 0:
-                dlt_pts_xyz_emb = dlt_pts_xyz_emb_all[data['geo_msks']] #N_valid,3+sinusoidal_dim*3
-                dlt_pts_type_emb = self.dlt_type_embed.unsqueeze(0).expand(dlt_pts_xyz.shape[0], -1) #N,type_embed_dim
-                dlt_pts_feat = torch.zeros((N_dlt_pts, self.in_channel), device=dlt_pts_xyz.device)
-                dlt_pts_feat_used = torch.cat([dlt_pts_type_emb, dlt_pts_xyz_emb], dim=1) #N_valid, in_channel
-                dlt_pts_feat[:, :dlt_pts_feat_used.shape[1]] = dlt_pts_feat_used
-            
-            ff_pts_xyz = data['ff_pts'] #K,3
-            ff_pts_xyz_emb = self.sinusoidal_embedding(ff_pts_xyz) #K,3+sinusoidal_dim*3
-            ff_pts_type_emb = self.ff_type_embed.unsqueeze(0).expand(ff_pts_xyz.shape[0], -1) #K,type_embed_dim
-            ff_pts_conf = data['ff_pts_conf'].unsqueeze(-1) #K,1
-            ff_pts_tgtdlt_emb = dlt_pts_xyz_emb_all #N,3+sinusoidal_dim*3 (Have already zero-padded invalid dlt points)
-            ff_pts_totgt_delta = (ff_pts_xyz - dlt_pts_xyz_all).view(-1,3)
-            if self.use_ff_emb_only or self.wo_d2s_emb:
-                #set ff_pts_tgtdlt_emb and ff_pts_totgt_delta to zero
-                ff_pts_tgtdlt_emb = torch.zeros_like(ff_pts_tgtdlt_emb)
-                ff_pts_totgt_delta = torch.zeros_like(ff_pts_totgt_delta)
-            ff_pts_totgt_delta[~data['geo_msks']] = 0 #zero pad for invalid dlt points
-            ff_pts_feat = torch.cat([ff_pts_type_emb, ff_pts_xyz_emb, ff_pts_conf, ff_pts_tgtdlt_emb, ff_pts_totgt_delta], dim=1) #K, in_channel
+                dlt_pts_xyz_emb = dlt_pts_xyz_emb_all[geo_msks]
+                dlt_pts_type_emb = self.dlt_type_embed.unsqueeze(0).expand(
+                    dlt_pts_xyz.shape[0], -1
+                )
+                dlt_pts_feat = torch.zeros(
+                    (N_dlt_pts, self.in_channel), device=dlt_pts_xyz.device
+                )
+                dlt_pts_feat_used = torch.cat(
+                    [dlt_pts_type_emb, dlt_pts_xyz_emb], dim=1
+                )
+                dlt_pts_feat[:, : dlt_pts_feat_used.shape[1]] = dlt_pts_feat_used
+
+            ff_pts_xyz_emb = self.sinusoidal_embedding(ff_pts_xyz)
+            ff_pts_type_emb = self.ff_type_embed.unsqueeze(0).expand(
+                ff_pts_xyz.shape[0], -1
+            )
+            ff_pts_conf = data["ff_pts_conf"].unsqueeze(-1)
+            if geo_empty:
+                ff_pts_tgtdlt_emb = torch.zeros(
+                    ff_pts_xyz.shape[0], dlt_emb_w, device=device, dtype=dtype
+                )
+                ff_pts_totgt_delta = torch.zeros_like(ff_pts_xyz)
+            else:
+                ff_pts_tgtdlt_emb = dlt_pts_xyz_emb_all
+                ff_pts_totgt_delta = (ff_pts_xyz - dlt_pts_xyz_all).reshape(-1, 3)
+                if self.use_ff_emb_only or self.wo_d2s_emb:
+                    ff_pts_tgtdlt_emb = torch.zeros_like(ff_pts_tgtdlt_emb)
+                    ff_pts_totgt_delta = torch.zeros_like(ff_pts_totgt_delta)
+                else:
+                    ff_pts_totgt_delta[~geo_msks] = 0
+            ff_pts_feat = torch.cat(
+                [
+                    ff_pts_type_emb,
+                    ff_pts_xyz_emb,
+                    ff_pts_conf,
+                    ff_pts_tgtdlt_emb,
+                    ff_pts_totgt_delta,
+                ],
+                dim=1,
+            )
         
             if N_dlt_pts > 0:
                 feat = torch.cat([ff_pts_feat, dlt_pts_feat], dim=0) #(K+N), in_channel
@@ -152,7 +195,9 @@ class BasePredictor(torch.nn.Module):
 
         model_input = {}
 
-        model_input['feat'] = torch.cat(batched_feat, dim=0) #
+        model_input['feat'] = torch.cat(batched_feat, dim=0)
+        # DDP: dlt_type_embed is otherwise unused when N_dlt_pts==0 on this rank.
+        model_input["feat"] = model_input["feat"] + self.dlt_type_embed.sum() * 0
         model_input['offset'] = torch.tensor(offset).cumsum(dim=0).to(feat.device) #(B,)
         model_input['coord'] = torch.cat(coord, dim=0) #(sum(K+N)),3
         #model_input['grid_coord'] = ((model_input['coord'].clamp(-1,1) + 1) / 2.0 * self.grid_resolution).floor().int().clamp(0,self.grid_resolution-1) # (sum(K+N)),3 in [0, grid_resolution]
@@ -165,9 +210,9 @@ class BasePredictor(torch.nn.Module):
             'ff_pts_in': [],
             'ff_pts_out': [],
             'ff_pts_conf_out': [],
-            'geo_pts_out': [], #The same shape as ff_pts_out
-            'geo_pts_conf_out': [],
-            'geo_msks': [], #for supervision
+            'dlt_pts_out': [], #The same shape as ff_pts_out
+            'dlt_pts_conf_out': [],
+            'dlt_msks': [], #for supervision
             'offset': []
         }
         if 'gt_pts' in batchdata_list[0]:
@@ -175,22 +220,37 @@ class BasePredictor(torch.nn.Module):
             output_dict['gt_msks'] = []
         start_idx = 0
         for data in batchdata_list:
-            num_ff = data['ff_pts'].shape[0]
-            num_dlt = data['geo_pts'][data['geo_msks']].shape[0] if not self.use_ff_only else 0
+            num_ff = data["ff_pts"].shape[0]
+            if self.use_ff_only:
+                num_dlt = 0
+            else:
+                geo, msk = data["geo_pts"], data["geo_msks"]
+                if (
+                    isinstance(geo, torch.Tensor)
+                    and isinstance(msk, torch.Tensor)
+                    and geo.shape[0] == msk.shape[0]
+                ):
+                    num_dlt = int(geo[msk].shape[0])
+                else:
+                    num_dlt = 0
             end_idx = start_idx + num_ff + num_dlt
             ff_pts_out = xyz_out[start_idx:start_idx+num_ff]
             ff_pts_conf_out = conf_out[start_idx:start_idx+num_ff]
-            dlt_pts_out = torch.zeros_like(data['geo_pts'])
-            dlt_pts_conf_out = torch.zeros_like(data['geo_pts'][...,0])
-            if not self.use_ff_only:
-                dlt_pts_out[data['geo_msks']] = xyz_out[start_idx+num_ff:end_idx]
-                dlt_pts_conf_out[data['geo_msks']] = conf_out[start_idx+num_ff:end_idx]
+            dlt_pts_out = torch.zeros_like(data["geo_pts"])
+            dlt_pts_conf_out = torch.zeros_like(data["geo_pts"][..., 0])
+            if not self.use_ff_only and num_dlt > 0:
+                dlt_pts_out[data["geo_msks"]] = xyz_out[
+                    start_idx + num_ff : end_idx
+                ]
+                dlt_pts_conf_out[data["geo_msks"]] = conf_out[
+                    start_idx + num_ff : end_idx
+                ]
             output_dict['ff_pts_in'].append(data['ff_pts'])
             output_dict['ff_pts_out'].append(ff_pts_out)
             output_dict['ff_pts_conf_out'].append(ff_pts_conf_out)
-            output_dict['geo_pts_out'].append(dlt_pts_out)
-            output_dict['geo_pts_conf_out'].append(dlt_pts_conf_out)
-            output_dict['geo_msks'].append(data['geo_msks'])
+            output_dict['dlt_pts_out'].append(dlt_pts_out)
+            output_dict['dlt_pts_conf_out'].append(dlt_pts_conf_out)
+            output_dict['dlt_msks'].append(data['geo_msks'])
             if 'gt_pts' in data:
                 output_dict['gt_pts'].append(data['gt_pts'])
             if 'gt_msks' in data:

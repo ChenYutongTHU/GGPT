@@ -1,0 +1,99 @@
+defaults:
+  - traindataset_configs: scannetpp-train_from-romav2_octree
+  - train_eval_subset_configs: scannetpp-train-subset
+
+common_config:
+  seed: 42
+  ddp: true
+  num_workers: 4
+
+octree_thresholds:
+  max_ff_pts_perchunk: 200000 #reduce from 400k
+  overlap_ratio: 0.02
+  min_radius_perchunk: 0.2
+  octree_root_trim_quantile: 0.01
+  octree_grid_resolution: ${model_config.grid_resolution}
+  octree_occ_downsample_factors: [1, 4]
+  # Single control: max occupied voxel density at each downsample level.
+  voxel_density: 0.2
+
+eval_only: false
+
+valdataset_configs:
+  _target_: ggpt.dataloader.eval_dataset.EvalDataset
+  pca_transform: True
+  chunk_sample: 'octree'
+  # Match traindataset_configs octree geometry (scannetpp-train_from-romav2_octree.yaml)
+  max_ff_pts_perchunk: ${octree_thresholds.max_ff_pts_perchunk}
+  overlap_ratio: ${octree_thresholds.overlap_ratio}
+  min_radius_perchunk: ${octree_thresholds.min_radius_perchunk}
+  octree_root_trim_quantile: ${octree_thresholds.octree_root_trim_quantile}
+  octree_grid_resolution: ${octree_thresholds.octree_grid_resolution}
+  octree_occ_downsample_factors: ${octree_thresholds.octree_occ_downsample_factors}
+  voxel_density: ${octree_thresholds.voxel_density}
+  data_dict:
+    scannetpp8views_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/scannetpp_8views/*
+    eth3d8views_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/eth3d_8views/*
+    tandt8views_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/tandt_8views/*
+    mvdrk_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/mvdvrk/*
+    4ddress_vggt-point-romav2-base: outputs/benchmark/sfm_vggt-point-romav2-base/save/4ddress/*
+
+# Train-subset eval is on via defaults → train_eval_subset_configs/scannet_train24.yaml (24 scenes).
+# Disable: remove ` - train_eval_subset_configs: scannet_train24` from defaults and set train_eval_subset_configs=null
+
+enable_amp: True 
+load_ckpt: last 
+train_config:
+  save_every: 1500
+  eval_every: 1500
+  progress_log_every: 200
+  dataloader_config:
+    batch_size: 1 
+  optimizer_config:
+    lr: 1e-4
+    global_step: 500000
+    grad_clip_norm: 0.1
+  loss:
+    _target_: ggpt.loss.LossComputer
+    ff_lap_weight: 1.0
+    dlt_lap_weight: 1.0
+    id_weight: 1.0
+    laplacian_beta: 1
+    laplacian_gamma: 0.2
+    dlt_part_weight: 1.0
+    non_dlt_part_weight: 1.0
+    chamfer_weight: 0.0
+    chamfer_max_num: 100000
+    nc_weight: null
+    local_geo_weights: null
+    local_geo_use_conf: False
+
+  wandb_config:
+    project: GGPT-train
+    resume: True
+
+
+hydra:
+  run: 
+    dir: outputs/train/exp_name
+
+model_config:
+  _target_: ggpt.model.base.BasePredictor
+  grid_resolution: 384 
+  type_embed_dim: 16
+  sinusoidal_dim: 32
+  zero_init: True
+  predict_residual: True
+  backbone_type: 'ptv3' #or 'spconv_unet'
+  ptv3_config:
+    enc_dim: 128
+    output_dim: 96
+    turn_off_bn: False 
+    stride: 
+      - 2
+      - 2
+      - 2
+      - 2
+    enable_flash: True
+    embedding_type: 'MLP'
+  head_width: 256

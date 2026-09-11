@@ -160,6 +160,57 @@ python -m torch.distributed.run --nnodes=1 --nproc_per_node=1 \
     valdataset_configs.data_dict.custom_eval_set=outputs/custom_eval/sfm_vggt-point_romav2/save/custom_eval_set \
     hydra.run.dir=outputs/custom_eval/ggpt_vggt-point_romav2
 ```
+
+## 4. 🏋️‍♀️ Training
+
+### 4.1 Dataset Download
+Our model is trained on [ScanNet++](https://scannetpp.mlsg.cit.tum.de/scannetpp/). Please follow their instruction to download RGB videos, camera parameters, and 3D scans. We use their provided script to render the 3D scans (in .ply) to depth maps. The files will be structured as
+
+```text
+scannetpp/data
+└── 00777c41d4/
+    ├── dslr/                
+        ├── nerfstudio/transforms_undistorted.json # pinhole camera parameters
+        ├── dslr/         
+        ├── resized_undistorted_images/ 
+            ├── DSC00000.JPG  # undistorted RGB  
+            └── ...          
+        └── render_depth/     # rendered depths 
+            ├── DSC00000.png    
+            └── ... 
+    └── scans/                  # The mesh to render
+           └── mesh_aligned_0.05.ply
+```
+
+### 4.2 View Sampling
+
+Given the downloaded scenes and processed depth maps, we sample groups of views (image sequences) per scene with controlled varying overlappings and baselines to use as training sequences for GGPT.
+
+```bash
+export SCANNETPP_ROOT=YOUR_PATH/scannetpp/data
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=1 --rdzv-endpoint=localhost:2026 \
+    data/sample_views.py
+```
+We save our sampled sequences [here](https://huggingface.co/YutongGoose/GGPT/blob/main/scannet_train_samplenum4-16_r0.3-1.0_alpha5-180.json).
+
+### 4.3 SfM 
+
+We run SfM and save results on all sampled sequences.
+
+```
+export HYDRA_FULL_ERROR=1
+num_gpus=4
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=$num_gpus --rdzv-endpoint=localhost:2026 \
+    sfm/run_benchmark_sfm.py --config_name=train/run-save-sfm 
+```
+
+### 4.4 Training GGPT
+
+```
+bash scripts/train/train.sh
+```
+
+
 ## 💡 Limitations
 
 While our work demonstrates that geometry optimization provides meaningful constraints that significantly improve feed-forward 3D reconstruction, our current method can still fail under specific conditions. For an in-depth discussion, please refer to the limitations section in our paper's appendix.

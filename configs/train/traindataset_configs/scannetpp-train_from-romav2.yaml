@@ -1,0 +1,18 @@
+_target_: ggpt.dataloader.train_dataset.TrainDataset
+# Glob per dataset key: each matched folder must contain ff_outputs.bin, sfm_dlt_outputs.bin, gt.bin
+data_dict:
+  scannet_train: outputs/train/sfm/train/save/scannetpp_train/*
+num_data_per_scene: 100
+max_ff_pts_perchunk: ${octree_thresholds.max_ff_pts_perchunk}
+overlap_ratio: ${octree_thresholds.overlap_ratio}
+min_radius_perchunk: ${octree_thresholds.min_radius_perchunk}
+octree_root_trim_quantile: ${octree_thresholds.octree_root_trim_quantile}
+octree_grid_resolution: ${octree_thresholds.octree_grid_resolution}
+octree_occ_downsample_factors: ${octree_thresholds.octree_occ_downsample_factors}
+voxel_density: ${octree_thresholds.voxel_density}
+min_geo_pts_perchunk: 1000
+min_ff_pts_perchunk: 10000
+chunk_size: 0.2
+seed: 42
+pca_transform: False
+downsample_stride: 1

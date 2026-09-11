@@ -1,0 +1,56 @@
+# @package _global_
+# Without this, loading the config via `--config-name=train/run-save-sfm` (a group-qualified
+# name) nests everything under a `train:` key instead of the top level, and run_benchmark_sfm.py's
+# `cfg.valdataset_configs` etc. would break.
+
+valdataset_configs:
+  - _target_: sfm.dataloader.scannetpp.ScanNetPPRawDataset
+    name: scannetpp_train
+    root: ${oc.env:SCANNETPP_ROOT,scannetpp/data}
+    sample_extracted: False
+    sampled_file: outputs/train/sample_views/scannetpp-train/views/scannet_train_samplenum4-16_r0.3-1.0_alpha5-180.json
+
+feedforward_config:
+  model: vggt-point
+  dav3:
+    input_pose: False   
+  pi3x:
+    input_intrinsics: False
+    input_extrinsics: False
+
+match_config:
+  models: ['romav2-base']
+  save_vis: False
+
+ba_config:
+  score_thresh: 0.6
+  cycle_err_thresh: 2
+  ff_err_thresh: null
+  mintrack_per_view: 2048
+  shared_camera: True #!
+  refine_focal_length: True
+  calibrated: False  
+  loss_function_type: 'cauchy'
+  loss_function_scale: 0.1
+  camera_type: PINHOLE
+
+dlt_config:
+  score_thresh: 0.1
+  cycle_err_thresh: 4 
+  max_epipolar_error: 4 # no
+  min_tri_angle: 3
+  max_reproj_error: 4
+  batch_size: 500000
+
+common_config:
+  seed: 47
+  ddp: True
+  num_workers: 4
+  save_vis: False
+  save_outputs: True
+  run_sfm: True
+  reduce_memory: False #delete intermediate results and models to free memory
+
+hydra:
+  run: 
+    dir: outputs/train/sfm
