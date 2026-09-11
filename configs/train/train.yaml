@@ -34,9 +34,9 @@ valdataset_configs:
   data_dict:
     scannetpp8views_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/scannetpp_8views/*
     eth3d8views_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/eth3d_8views/*
-    tandt8views_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/tandt_8views/*
-    mvdrk_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/mvdvrk/*
-    4ddress_vggt-point-romav2-base: outputs/benchmark/sfm_vggt-point-romav2-base/save/4ddress/*
+    #tandt8views_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/tandt_8views/*
+    #mvdrk_vggt-depth-romav2-base: outputs/benchmark/sfm_vggt-depth-romav2-base/save/mvdvrk/*
+    #4ddress_vggt-point-romav2-base: outputs/benchmark/sfm_vggt-point-romav2-base/save/4ddress/*
 
 # Train-subset eval is on via defaults → train_eval_subset_configs/scannet_train24.yaml (24 scenes).
 # Disable: remove ` - train_eval_subset_configs: scannet_train24` from defaults and set train_eval_subset_configs=null
@@ -44,8 +44,8 @@ valdataset_configs:
 enable_amp: True 
 load_ckpt: last 
 train_config:
-  save_every: 1500
-  eval_every: 1500
+  save_every: 2000
+  eval_every: 2000
   progress_log_every: 200
   dataloader_config:
     batch_size: 1 

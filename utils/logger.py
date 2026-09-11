@@ -6,6 +6,7 @@ class EvalLogger():
         os.makedirs(dirname, exist_ok=True)
         self.dirname = dirname
         self.dic = {}
+        self.dataset2average = None
     def write(self, metric_dict, prefix, dataset_key, seq_key):
         if dataset_key not in self.dic:
             self.dic[dataset_key] = {}
@@ -59,8 +60,10 @@ class EvalLogger():
                     dataset2average[dataset_key] = dict(sorted(dataset2average[dataset_key].items()))
                 with open(os.path.join(self.dirname, f'average.json'),'w') as f:
                     json.dump(dataset2average, f, indent=4)
+                self.dataset2average = dataset2average
                 return dataset2average
             else:
+                self.dataset2average = None
                 return None
         else:
             return None

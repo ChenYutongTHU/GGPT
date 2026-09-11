@@ -380,6 +380,7 @@ def main(cfg):
             log_payload["Train/avg_ff_points_per_chunk_step"] = (
                 global_ff_points_sum / max(global_chunk_count, 1)
             )
+            '''
             # Scene-level octree stats (from chunk_by_octree leaves), same for every chunk in a scene.
             if per_scene_chunk_stats:
                 scene_chunk_counts = []
@@ -394,6 +395,7 @@ def main(cfg):
                 log_payload["Train/scene_avg_ff_points_per_chunk_mean"] = float(
                     sum(scene_avg_pts) / max(len(scene_avg_pts), 1)
                 )
+            '''
             wandb.log(log_payload, step=step)
             if _should_log_progress(step, start_step, final_step, progress_log_every):
                 Print(
